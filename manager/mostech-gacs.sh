@@ -1245,7 +1245,6 @@ setup_panel_source() {
   if [ -d "$PANEL_SRC_DIR/.git" ]; then
     step "Updating SkyGenPanel source..."
     git -C "$PANEL_SRC_DIR" remote set-url origin "$PANEL_REPO" >/dev/null 2>&1
-    if git -C "$PANEL_SRC_DIR" fetch --depth 1 origin "$PANEL_BRANCH" && \
     if git -C "$PANEL_SRC_DIR" fetch --depth 1 origin "$PANEL_BRANCH" &&
        git -C "$PANEL_SRC_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1; then
       ok "Source updated: ${W}$(git -C "$PANEL_SRC_DIR" log -1 --format='%h %s' 2>/dev/null)${N}"
@@ -1323,6 +1322,16 @@ build_panel_image() {
     sed -i "s/genieAcsUrl: '',/genieAcsUrl: process.env.GENIEACS_URL || '',/" "$seed_file"
   fi
 
+  # Exclude GACS-Farm instance subdomains (panel-*, portal-*, acs-*, cwmp-*, nbi-*, fs-*)
+  # from RemoteProxyService so setting remoteProxyBaseDomain never hijacks the panel URL.
+  local proxy_file="$PANEL_SRC_DIR/backend/src/services/remoteProxyService.js"
+  if [ -f "$proxy_file" ] && ! grep -q "RESERVED_SUBDOMAIN_PREFIXES" "$proxy_file"; then
+    sed -i "s/RESERVED_SUBDOMAINS.has(sub)/RESERVED_SUBDOMAINS.has(sub) || \/^\\(panel\|portal\|acs\|cwmp\|nbi\|fs\\)-\/i.test(sub)/g" "$proxy_file"
+  fi
+
+  # Remove any accidentally tracked local database or .env from build context.
+  rm -rf "$PANEL_SRC_DIR/backend/data" "$PANEL_SRC_DIR/backend/.env"
+
   step "Building image ${W}$PANEL_IMAGE${N} (bisa beberapa menit)..."
   if docker build -t "$PANEL_IMAGE" "$PANEL_SRC_DIR"; then
     ok "Image ${W}$PANEL_IMAGE${N} built."
@@ -1386,10 +1395,12 @@ write_panel_override() {
   load_config
 
   local cors="http://localhost:${port_panel}"
+  local sch="http"
+  local remote_enabled="false"
   if [ -n "$BASE_DOMAIN" ]; then
-    local sch="http"
     [ "$SSL_ENABLED" == "true" ] && sch="https"
     cors="${sch}://panel-${name}.${BASE_DOMAIN},${sch}://portal-${name}.${BASE_DOMAIN}"
+    remote_enabled="true"
   fi
 
   cat > "$INSTANCES_DIR/$name/docker-compose.override.yml" <<EOF
@@ -1408,7 +1419,11 @@ services:
       - PORTAL_PORT=5891
       - TRUST_PROXY=1
       - DATA_DIR=/var/lib/skygenpanel
+      - INSTANCE_NAME=${name}
       - GENIEACS_URL=http://genieacs-nbi:7557
+      - REMOTE_PROXY_ENABLED=${remote_enabled}
+      - REMOTE_PROXY_BASE_DOMAIN=${BASE_DOMAIN}
+      - REMOTE_PROXY_SCHEME=${sch}
       - CORS_ORIGINS=${cors}
     volumes:
       - panel-data:/var/lib/skygenpanel
@@ -1435,20 +1450,30 @@ generate_panel_nginx_conf() {
   local conf="$NGINX_CONF_DIR/${name}.panel.conf"
   : > "$conf"
 
-  local pair sub port
+  # Route <SerialNumber>-<instance>.<BASE_DOMAIN> to this instance's panel so
+  # every instance supports Remote Device Web simultaneously under one wildcard cert.
+  local escaped_domain="${BASE_DOMAIN//./\\.}"
+  local panel_server_names="panel-${name}.${BASE_DOMAIN} ~^[^.]+-${name}\\.${escaped_domain}\$"
+  if ! grep -ql "\*\.${BASE_DOMAIN}" "$NGINX_CONF_DIR"/*.panel.conf 2>/dev/null; then
+    panel_server_names="${panel_server_names} *.${BASE_DOMAIN}"
+  fi
+
+  local pair sub port sname
   for pair in "panel-${name}:${port_panel}" "portal-${name}:${port_portal}"; do
     sub="${pair%:*}"
     port="${pair##*:}"
+    sname="${sub}.${BASE_DOMAIN}"
+    [ "$sub" == "panel-${name}" ] && sname="$panel_server_names"
     if [ "$SSL_ENABLED" == "true" ]; then
       cat >> "$conf" <<EOF
 server {
     listen 80;
-    server_name ${sub}.${BASE_DOMAIN};
+    server_name ${sname};
     return 301 https://\$host\$request_uri;
 }
 server {
     listen 443 ssl;
-    server_name ${sub}.${BASE_DOMAIN};
+    server_name ${sname};
     ssl_certificate /etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${BASE_DOMAIN}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -1468,7 +1493,7 @@ EOF
       cat >> "$conf" <<EOF
 server {
     listen 80;
-    server_name ${sub}.${BASE_DOMAIN};
+    server_name ${sname};
     location / {
         proxy_pass http://host.docker.internal:${port};
         proxy_http_version 1.1;
@@ -1525,6 +1550,15 @@ deploy_panel() {
     return 1
   fi
 
+  # Ensure Docker containers (panel Remote Proxy & GenieACS CWMP summon) can
+  # reach ONU private subnets over L2TP ppp+ interfaces via MASQUERADE.
+  if [ -n "$FW_CMD" ]; then
+    $FW_CMD -t nat -C POSTROUTING -o ppp+ -j MASQUERADE 2>/dev/null || $FW_CMD -t nat -A POSTROUTING -o ppp+ -j MASQUERADE 2>/dev/null
+    $FW_CMD -C FORWARD -o ppp+ -j ACCEPT 2>/dev/null || $FW_CMD -I FORWARD 1 -o ppp+ -j ACCEPT 2>/dev/null
+    $FW_CMD -C FORWARD -i ppp+ -j ACCEPT 2>/dev/null || $FW_CMD -I FORWARD 1 -i ppp+ -j ACCEPT 2>/dev/null
+    fw_save
+  fi
+
   generate_panel_nginx_conf "$name" "$port_panel" "$port_portal"
   log_action "PANEL" "Deployed for '$name' | PANEL=$port_panel PORTAL=$port_portal"
   ok "SkyGenPanel '${W}$name${N}' running (panel=:${W}$port_panel${N}, portal=:${W}$port_portal${N})."
@@ -1561,9 +1595,6 @@ remove_panel() {
 
   local project vols
   project=$(echo "$name" | tr '[:upper:]' '[:lower:]')
-  vols=$(docker volume ls -q \
-    --filter "label=com.docker.compose.project=${project}" \
-    --filter "label=com.docker.compose.volume=panel-data")
   vols=$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=panel-data")
   [ -n "$vols" ] && docker volume rm $vols >/dev/null 2>&1
 
@@ -1616,8 +1647,6 @@ manage_panel_menu() {
       1)
         header "ADD SKYGENPANEL"
         if list_instances && select_instance "Pilih nomor instance:"; then
-          instance_has_panel "$SELECTED_INSTANCE" && \
-            info "Instance sudah punya panel → redeploy (data & port tetap)."
           instance_has_panel "$SELECTED_INSTANCE" && info "Instance sudah punya panel → redeploy (data & port tetap)."
           if deploy_panel "$SELECTED_INSTANCE"; then
             divider
