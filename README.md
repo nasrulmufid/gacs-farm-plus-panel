@@ -81,7 +81,7 @@ CLI manager untuk deploy, monitor, dan manage **multi-instance GenieACS (TR-069 
 
 ```bash
 # 1. Clone repository (path bebas)
-git clone https://github.com/safrinnetwork/GACS-Farm.git /home/docker/genieacs
+git clone https://github.com/nasrulmufid/gacs-farm-plus-panel.git /home/docker/genieacs
 cd /home/docker/genieacs/manager
 
 # 2. Jalankan manager (harus root)
