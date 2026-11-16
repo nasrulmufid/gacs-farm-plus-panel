@@ -121,6 +121,11 @@ load_config() {
   BASE_DOMAIN="" CF_API_TOKEN="" CF_EMAIL="" SSL_ENABLED="" PANEL_REPO="" PANEL_BRANCH=""
   [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
   PANEL_REPO="${PANEL_REPO:-$DEFAULT_PANEL_REPO}"
+  PANEL_REPO="${PANEL_REPO//$'\r'/}"
+  PANEL_BRANCH="${PANEL_BRANCH//$'\r'/}"
+  if [[ ! "$PANEL_REPO" =~ ^(https?://|git@|ssh://) ]]; then
+    PANEL_REPO="$DEFAULT_PANEL_REPO"
+  fi
   PANEL_BRANCH="${PANEL_BRANCH:-$DEFAULT_PANEL_BRANCH}"
 }
 
@@ -1242,6 +1247,7 @@ setup_panel_source() {
     step "Updating SkyGenPanel source..."
     git -C "$PANEL_SRC_DIR" remote set-url origin "$PANEL_REPO" >/dev/null 2>&1
     if git -C "$PANEL_SRC_DIR" fetch --depth 1 origin "$PANEL_BRANCH" >/dev/null 2>&1 && \
+    if git -C "$PANEL_SRC_DIR" fetch --depth 1 origin "$PANEL_BRANCH" && \
        git -C "$PANEL_SRC_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1; then
       ok "Source updated: ${W}$(git -C "$PANEL_SRC_DIR" log -1 --format='%h %s' 2>/dev/null)${N}"
       log_action "PANEL" "Source updated ($PANEL_REPO @ $PANEL_BRANCH)"
@@ -1249,6 +1255,8 @@ setup_panel_source() {
     fi
     err "Gagal update source SkyGenPanel."
     return 1
+    warn "Fetch gagal, mencoba re-clone bersih..."
+    rm -rf "$PANEL_SRC_DIR"
   fi
 
   if [ -e "$PANEL_SRC_DIR" ]; then
@@ -1280,6 +1288,14 @@ set_panel_repo() {
   if [ -n "$new_repo" ]; then
     if [[ ! "$new_repo" =~ ^[A-Za-z0-9@:/._~+-]+$ ]]; then
       err "Format repo URL tidak valid!"; return
+    if [ "$new_repo" == "default" ]; then
+      PANEL_REPO="$DEFAULT_PANEL_REPO"
+    elif [[ ! "$new_repo" =~ ^(https?://|git@|ssh://)[A-Za-z0-9@:/._~+-]+$ ]]; then
+      err "Format repo URL tidak valid! Harus diawali https:// atau git@"
+      info "Contoh: $DEFAULT_PANEL_REPO"
+      return
+    else
+      PANEL_REPO="$new_repo"
     fi
     PANEL_REPO="$new_repo"
   fi
@@ -1300,6 +1316,19 @@ build_panel_image() {
     info "Jalankan: ${W}Services & Settings → Setup Source → Clone / Update SkyGenPanel${N}"
     return 1
   fi
+
+  # Ensure backend/scripts is copied before `npm ci --omit=dev` so the
+  # package.json postinstall (`node scripts/install-cli.js`) can find it.
+  if [ -f "$PANEL_SRC_DIR/Dockerfile" ] && ! grep -q "COPY backend/scripts" "$PANEL_SRC_DIR/Dockerfile"; then
+    sed -i '/COPY backend\/package\*\.json \.\//a COPY backend/scripts ./scripts' "$PANEL_SRC_DIR/Dockerfile"
+  fi
+
+  # Ensure seed.js reads GENIEACS_URL from env if the upstream repo has not been updated yet.
+  local seed_file="$PANEL_SRC_DIR/backend/src/config/seed.js"
+  if [ -f "$seed_file" ] && ! grep -q "process.env.GENIEACS_URL" "$seed_file"; then
+    sed -i "s/genieAcsUrl: '',/genieAcsUrl: process.env.GENIEACS_URL || '',/" "$seed_file"
+  fi
+
   step "Building image ${W}$PANEL_IMAGE${N} (bisa beberapa menit)..."
   if docker build -t "$PANEL_IMAGE" "$PANEL_SRC_DIR"; then
     ok "Image ${W}$PANEL_IMAGE${N} built."
