@@ -120,7 +120,6 @@ log_action() {
 load_config() {
   BASE_DOMAIN="" CF_API_TOKEN="" CF_EMAIL="" SSL_ENABLED="" PANEL_REPO="" PANEL_BRANCH=""
   [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-  PANEL_REPO="${PANEL_REPO:-$DEFAULT_PANEL_REPO}"
   PANEL_REPO="${PANEL_REPO//$'\r'/}"
   PANEL_BRANCH="${PANEL_BRANCH//$'\r'/}"
   if [[ ! "$PANEL_REPO" =~ ^(https?://|git@|ssh://) ]]; then
@@ -1246,15 +1245,13 @@ setup_panel_source() {
   if [ -d "$PANEL_SRC_DIR/.git" ]; then
     step "Updating SkyGenPanel source..."
     git -C "$PANEL_SRC_DIR" remote set-url origin "$PANEL_REPO" >/dev/null 2>&1
-    if git -C "$PANEL_SRC_DIR" fetch --depth 1 origin "$PANEL_BRANCH" >/dev/null 2>&1 && \
     if git -C "$PANEL_SRC_DIR" fetch --depth 1 origin "$PANEL_BRANCH" && \
+    if git -C "$PANEL_SRC_DIR" fetch --depth 1 origin "$PANEL_BRANCH" &&
        git -C "$PANEL_SRC_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1; then
       ok "Source updated: ${W}$(git -C "$PANEL_SRC_DIR" log -1 --format='%h %s' 2>/dev/null)${N}"
       log_action "PANEL" "Source updated ($PANEL_REPO @ $PANEL_BRANCH)"
       return 0
     fi
-    err "Gagal update source SkyGenPanel."
-    return 1
     warn "Fetch gagal, mencoba re-clone bersih..."
     rm -rf "$PANEL_SRC_DIR"
   fi
@@ -1286,8 +1283,6 @@ set_panel_repo() {
   read -p "$(echo -e "${B}►${N} Branch baru (Enter = tetap): ")" new_branch
 
   if [ -n "$new_repo" ]; then
-    if [[ ! "$new_repo" =~ ^[A-Za-z0-9@:/._~+-]+$ ]]; then
-      err "Format repo URL tidak valid!"; return
     if [ "$new_repo" == "default" ]; then
       PANEL_REPO="$DEFAULT_PANEL_REPO"
     elif [[ ! "$new_repo" =~ ^(https?://|git@|ssh://)[A-Za-z0-9@:/._~+-]+$ ]]; then
@@ -1297,7 +1292,6 @@ set_panel_repo() {
     else
       PANEL_REPO="$new_repo"
     fi
-    PANEL_REPO="$new_repo"
   fi
   if [ -n "$new_branch" ]; then
     if [[ ! "$new_branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
@@ -1570,6 +1564,7 @@ remove_panel() {
   vols=$(docker volume ls -q \
     --filter "label=com.docker.compose.project=${project}" \
     --filter "label=com.docker.compose.volume=panel-data")
+  vols=$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=panel-data")
   [ -n "$vols" ] && docker volume rm $vols >/dev/null 2>&1
 
   rm -f "$dir/docker-compose.override.yml" "$dir/.panel.env"
@@ -1623,6 +1618,7 @@ manage_panel_menu() {
         if list_instances && select_instance "Pilih nomor instance:"; then
           instance_has_panel "$SELECTED_INSTANCE" && \
             info "Instance sudah punya panel → redeploy (data & port tetap)."
+          instance_has_panel "$SELECTED_INSTANCE" && info "Instance sudah punya panel → redeploy (data & port tetap)."
           if deploy_panel "$SELECTED_INSTANCE"; then
             divider
             show_panel_info "$SELECTED_INSTANCE"
